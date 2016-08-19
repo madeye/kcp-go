@@ -1,6 +1,7 @@
 package kcp
 
 import (
+	"bytes"
 	crand "crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -73,7 +74,7 @@ type (
 // newUDPSession create a new udp session for client or server
 func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
-	sess.sid = sid
+	sess.sid = make([]byte, sidSize)
 	sess.chTicker = make(chan time.Time, 1)
 	sess.chUDPOutput = make(chan []byte, txQueueLimit)
 	sess.die = make(chan struct{})
@@ -90,10 +91,19 @@ func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Lis
 	sess.xmitBuf.New = func() interface{} {
 		return make([]byte, mtuLimit)
 	}
+
+	// Copy sid
+	copy(sess.sid, sid)
+
 	// calculate header size
+	sess.headerSize = 0
 	if sess.block != nil {
 		sess.headerSize += cryptHeaderSize
 	}
+
+	sidOffset := sess.headerSize
+	sess.headerSize += sidSize
+
 	if sess.fec != nil {
 		sess.headerSize += fecHeaderSizePlus2
 	}
@@ -101,6 +111,7 @@ func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Lis
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
 		if size >= IKCP_OVERHEAD {
 			ext := sess.xmitBuf.Get().([]byte)[:sess.headerSize+size]
+			copy(ext[sidOffset:], sess.sid)
 			copy(ext[sess.headerSize:], buf)
 			select {
 			case sess.chUDPOutput <- ext:
@@ -369,9 +380,9 @@ func (s *UDPSession) writeTo(b []byte, addr net.Addr) (int, error) {
 
 func (s *UDPSession) outputTask() {
 	// offset pre-compute
-	fecOffset := 0
+	fecOffset := sidSize
 	if s.block != nil {
-		fecOffset = cryptHeaderSize
+		fecOffset += cryptHeaderSize
 	}
 	szOffset := fecOffset + fecHeaderSize
 
@@ -395,7 +406,6 @@ func (s *UDPSession) outputTask() {
 		select {
 		case ext := <-s.chUDPOutput:
 			var ecc [][]byte
-			ext = append(s.sid, ext...)
 			if s.fec != nil {
 				s.fec.markData(ext[fecOffset:])
 				// explicit size
@@ -504,7 +514,7 @@ func (s *UDPSession) updateTask() {
 			s.mu.Unlock()
 		case <-s.die:
 			if s.l != nil { // has listener
-				s.l.chDeadlinks <- s.remote
+				s.l.chDeadlinks <- string(s.sid)
 			}
 			return
 		}
@@ -620,6 +630,14 @@ func (s *UDPSession) readLoop() {
 				dataValid = true
 			}
 
+			sid := data[:sidSize]
+
+			if !bytes.Equal(sid, s.sid) {
+				dataValid = false
+			} else {
+				data = data[sidSize:]
+			}
+
 			if dataValid {
 				s.kcpInput(data)
 			}
@@ -640,7 +658,7 @@ type (
 		conn                     *net.UDPConn
 		sessions                 map[string]*UDPSession
 		chAccepts                chan *UDPSession
-		chDeadlinks              chan net.Addr
+		chDeadlinks              chan string
 		headerSize               int
 		die                      chan struct{}
 		rxbuf                    sync.Pool
@@ -680,10 +698,13 @@ func (l *Listener) monitor() {
 			}
 
 			if dataValid {
+				// Get sid
 				sid := data[:sidSize]
 				data = data[sidSize:]
+
 				s, ok := l.sessions[string(sid)]
 				if !ok { // new session
+					log.Println("new session")
 					var conv uint32
 					convValid := false
 					if l.fec != nil {
@@ -715,7 +736,7 @@ func (l *Listener) monitor() {
 			xorBytes(raw, raw, raw)
 			l.rxbuf.Put(raw)
 		case deadlink := <-l.chDeadlinks:
-			delete(l.sessions, deadlink.String())
+			delete(l.sessions, deadlink)
 		case <-l.die:
 			return
 		case <-ticker.C:
@@ -800,7 +821,7 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 	l.conn = conn
 	l.sessions = make(map[string]*UDPSession)
 	l.chAccepts = make(chan *UDPSession, 1024)
-	l.chDeadlinks = make(chan net.Addr, 1024)
+	l.chDeadlinks = make(chan string, 1024)
 	l.die = make(chan struct{})
 	l.dataShards = dataShards
 	l.parityShards = parityShards
@@ -811,12 +832,14 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 	}
 
 	// calculate header size
+	l.headerSize = 0
 	if l.block != nil {
 		l.headerSize += cryptHeaderSize
 	}
 	if l.fec != nil {
 		l.headerSize += fecHeaderSizePlus2
 	}
+	l.headerSize += sidSize
 
 	go l.monitor()
 	return l, nil
