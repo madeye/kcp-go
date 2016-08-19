@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/klauspost/crc32"
+	"github.com/satori/go.uuid"
 
 	"golang.org/x/net/ipv4"
 )
@@ -31,6 +32,7 @@ type OptionWithConvId struct {
 const (
 	defaultWndSize           = 128 // default window size, in packet
 	nonceSize                = 16  // magic number
+	sidSize                  = 16  // Session ID
 	crcSize                  = 4   // 4bytes packet checksum
 	cryptHeaderSize          = nonceSize + crcSize
 	connTimeout              = 60 * time.Second
@@ -43,6 +45,7 @@ const (
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
+		sid               []byte       // Session ID
 		kcp               *KCP         // the core ARQ
 		fec               *FEC         // forward error correction
 		conn              *net.UDPConn // the underlying UDP socket
@@ -68,8 +71,9 @@ type (
 )
 
 // newUDPSession create a new udp session for client or server
-func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
+func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
+	sess.sid = sid
 	sess.chTicker = make(chan time.Time, 1)
 	sess.chUDPOutput = make(chan []byte, txQueueLimit)
 	sess.die = make(chan struct{})
@@ -391,6 +395,7 @@ func (s *UDPSession) outputTask() {
 		select {
 		case ext := <-s.chUDPOutput:
 			var ecc [][]byte
+			ext = append(s.sid, ext...)
 			if s.fec != nil {
 				s.fec.markData(ext[fecOffset:])
 				// explicit size
@@ -675,8 +680,9 @@ func (l *Listener) monitor() {
 			}
 
 			if dataValid {
-				addr := from.String()
-				s, ok := l.sessions[addr]
+				sid := data[:sidSize]
+				data = data[sidSize:]
+				s, ok := l.sessions[string(sid)]
 				if !ok { // new session
 					var conv uint32
 					convValid := false
@@ -692,15 +698,16 @@ func (l *Listener) monitor() {
 					}
 
 					if convValid {
-						if s := newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
+						if s := newUDPSession(sid, conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
 							s.kcpInput(data)
-							l.sessions[addr] = s
+							l.sessions[string(sid)] = s
 							l.chAccepts <- s
 						} else {
 							log.Println("cannot create session")
 						}
 					}
 				} else {
+					s.remote = from
 					s.kcpInput(data)
 				}
 			}
@@ -843,7 +850,8 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 			log.Println("unrecognized option", opt)
 		}
 	}
-	return newUDPSession(convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
+	sid := uuid.NewV4().Bytes()
+	return newUDPSession(sid, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
 }
 
 func currentMs() uint32 {
