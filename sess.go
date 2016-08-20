@@ -946,7 +946,7 @@ func DialWithOptions(raddr string, hasSid bool, block BlockCrypt, dataShards, pa
 	var sid []byte = nil
 
 	if hasSid {
-		sid = uuid.NewV2().Bytes()
+		sid = uuid.NewV2(uuid.DomainPerson).Bytes()
 	}
 
 	return newUDPSession(hasSid, sid, 0, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
