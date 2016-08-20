@@ -34,6 +34,7 @@ const (
 	defaultWndSize           = 128 // default window size, in packet
 	nonceSize                = 16  // magic number
 	sidSize                  = 16  // Session ID
+	tsSize                   = 4   // Timestamp
 	crcSize                  = 4   // 4bytes packet checksum
 	cryptHeaderSize          = nonceSize + crcSize
 	connTimeout              = 60 * time.Second
@@ -46,7 +47,8 @@ const (
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		sid               []byte       // Session ID
+		hasSid            bool         // if we have a session ID
+		sid               []byte       // session ID
 		kcp               *KCP         // the core ARQ
 		fec               *FEC         // forward error correction
 		conn              *net.UDPConn // the underlying UDP socket
@@ -64,6 +66,7 @@ type (
 		chTicker          chan time.Time
 		chUDPOutput       chan []byte
 		headerSize        int
+		sidOffset         int
 		ackNoDelay        bool
 		keepAliveInterval time.Duration
 		xmitBuf           sync.Pool
@@ -72,9 +75,9 @@ type (
 )
 
 // newUDPSession create a new udp session for client or server
-func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
+func newUDPSession(hasSid bool, sid []byte, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
-	sess.sid = make([]byte, sidSize)
+	sess.hasSid = hasSid
 	sess.chTicker = make(chan time.Time, 1)
 	sess.chUDPOutput = make(chan []byte, txQueueLimit)
 	sess.die = make(chan struct{})
@@ -92,8 +95,13 @@ func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Lis
 		return make([]byte, mtuLimit)
 	}
 
-	// Copy sid
-	copy(sess.sid, sid)
+	if hasSid {
+		sess.sid = make([]byte, sidSize)
+		// Copy sid
+		copy(sess.sid, sid)
+	} else {
+		sess.sid = nil
+	}
 
 	// calculate header size
 	sess.headerSize = 0
@@ -101,8 +109,11 @@ func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Lis
 		sess.headerSize += cryptHeaderSize
 	}
 
-	sidOffset := sess.headerSize
-	sess.headerSize += sidSize
+	sess.sidOffset = sess.headerSize
+
+	if sess.hasSid {
+		sess.headerSize += sidSize + tsSize
+	}
 
 	if sess.fec != nil {
 		sess.headerSize += fecHeaderSizePlus2
@@ -111,7 +122,6 @@ func newUDPSession(sid []byte, conv uint32, dataShards, parityShards int, l *Lis
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
 		if size >= IKCP_OVERHEAD {
 			ext := sess.xmitBuf.Get().([]byte)[:sess.headerSize+size]
-			copy(ext[sidOffset:], sess.sid)
 			copy(ext[sess.headerSize:], buf)
 			select {
 			case sess.chUDPOutput <- ext:
@@ -267,7 +277,12 @@ func (s *UDPSession) Close() error {
 func (s *UDPSession) LocalAddr() net.Addr { return s.local }
 
 // RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
-func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
+func (s *UDPSession) RemoteAddr() net.Addr {
+	s.mu.Lock()
+	remote := s.remote
+	s.mu.Unlock()
+	return remote
+}
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (s *UDPSession) SetDeadline(t time.Time) error {
@@ -380,7 +395,10 @@ func (s *UDPSession) writeTo(b []byte, addr net.Addr) (int, error) {
 
 func (s *UDPSession) outputTask() {
 	// offset pre-compute
-	fecOffset := sidSize
+	fecOffset := 0
+	if s.hasSid {
+		fecOffset += sidSize + tsSize
+	}
 	if s.block != nil {
 		fecOffset += cryptHeaderSize
 	}
@@ -431,6 +449,15 @@ func (s *UDPSession) outputTask() {
 				}
 			}
 
+			if s.hasSid {
+				copy(ext[s.sidOffset:], s.sid)
+				binary.LittleEndian.PutUint32(ext[s.sidOffset+sidSize:], currentMs())
+				for k := range ecc {
+					copy(ecc[k][s.sidOffset:], s.sid)
+					binary.LittleEndian.PutUint32(ecc[k][s.sidOffset+sidSize:], currentMs())
+				}
+			}
+
 			if s.block != nil {
 				io.ReadFull(crand.Reader, ext[:nonceSize])
 				checksum := crc32.ChecksumIEEE(ext[cryptHeaderSize:])
@@ -447,8 +474,12 @@ func (s *UDPSession) outputTask() {
 				}
 			}
 
+			s.mu.Lock()
+			remote := s.remote
+			s.mu.Unlock()
+
 			//if rand.Intn(100) < 80 {
-			n, err := s.writeTo(ext, s.remote)
+			n, err := s.writeTo(ext, remote)
 			if err != nil {
 				log.Println(err, n)
 			}
@@ -458,7 +489,7 @@ func (s *UDPSession) outputTask() {
 
 			if ecc != nil {
 				for k := range ecc {
-					n, err := s.writeTo(ecc[k], s.remote)
+					n, err := s.writeTo(ecc[k], remote)
 					if err != nil {
 						log.Println(err, n)
 					}
@@ -472,13 +503,14 @@ func (s *UDPSession) outputTask() {
 			if len(s.chUDPOutput) == 0 {
 				s.mu.Lock()
 				interval := s.keepAliveInterval
+				remote := s.remote
 				s.mu.Unlock()
 				if interval > 0 && time.Now().After(lastPing.Add(interval)) {
 					sz := s.rng.Intn(IKCP_MTU_DEF - s.headerSize - IKCP_OVERHEAD)
 					sz += s.headerSize + IKCP_OVERHEAD
 					ping := make([]byte, sz)
 					io.ReadFull(crand.Reader, ping)
-					n, err := s.writeTo(ping, s.remote)
+					n, err := s.writeTo(ping, remote)
 					if err != nil {
 						log.Println(err, n)
 					}
@@ -514,7 +546,11 @@ func (s *UDPSession) updateTask() {
 			s.mu.Unlock()
 		case <-s.die:
 			if s.l != nil { // has listener
-				s.l.chDeadlinks <- string(s.sid)
+				if s.hasSid {
+					s.l.chDeadlinks <- string(s.sid)
+				} else {
+					s.l.chDeadlinks <- s.remote.String()
+				}
 			}
 			return
 		}
@@ -630,12 +666,14 @@ func (s *UDPSession) readLoop() {
 				dataValid = true
 			}
 
-			sid := data[:sidSize]
+			if s.hasSid {
+				sid := data[:sidSize]
 
-			if !bytes.Equal(sid, s.sid) {
-				dataValid = false
-			} else {
-				data = data[sidSize:]
+				if !bytes.Equal(sid, s.sid) {
+					dataValid = false
+				} else {
+					data = data[sidSize+tsSize:]
+				}
 			}
 
 			if dataValid {
@@ -652,6 +690,7 @@ func (s *UDPSession) readLoop() {
 type (
 	// Listener defines a server listening for connections
 	Listener struct {
+		hasSid                   bool
 		block                    BlockCrypt
 		dataShards, parityShards int
 		fec                      *FEC // for fec init test
@@ -698,11 +737,23 @@ func (l *Listener) monitor() {
 			}
 
 			if dataValid {
-				// Get sid
-				sid := data[:sidSize]
-				data = data[sidSize:]
 
-				s, ok := l.sessions[string(sid)]
+				ok := false
+				key := from.String()
+
+				var sid []byte = nil
+				var ts uint32 = 0
+
+				if l.hasSid {
+					// Get sid
+					sid = data[:sidSize]
+					key = string(sid)
+					ts = binary.LittleEndian.Uint32(data[sidSize:])
+					data = data[sidSize+tsSize:]
+				}
+
+				s, ok := l.sessions[key]
+
 				if !ok { // new session
 					log.Println("new session")
 					var conv uint32
@@ -719,16 +770,24 @@ func (l *Listener) monitor() {
 					}
 
 					if convValid {
-						if s := newUDPSession(sid, conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
+						if s := newUDPSession(l.hasSid, sid, conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
 							s.kcpInput(data)
-							l.sessions[string(sid)] = s
+							l.sessions[key] = s
 							l.chAccepts <- s
 						} else {
 							log.Println("cannot create session")
 						}
 					}
 				} else {
-					s.remote = from
+					if l.hasSid {
+						now := currentMs()
+						diff := int32(now) - int32(ts)
+						if diff < IKCP_RTO_DEF && diff > -IKCP_RTO_DEF {
+							s.mu.Lock()
+							s.remote = from
+							s.mu.Unlock()
+						}
+					}
 					s.kcpInput(data)
 				}
 			}
@@ -802,12 +861,12 @@ func (l *Listener) Addr() net.Addr {
 
 // Listen listens for incoming KCP packets addressed to the local address laddr on the network "udp",
 func Listen(laddr string) (*Listener, error) {
-	return ListenWithOptions(laddr, nil, 0, 0)
+	return ListenWithOptions(laddr, false, nil, 0, 0)
 }
 
 // ListenWithOptions listens for incoming KCP packets addressed to the local address laddr on the network "udp" with packet encryption,
 // dataShards, parityShards defines Reed-Solomon Erasure Coding parameters
-func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards int) (*Listener, error) {
+func ListenWithOptions(laddr string, hasSid bool, block BlockCrypt, dataShards, parityShards int) (*Listener, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", laddr)
 	if err != nil {
 		return nil, err
@@ -819,6 +878,7 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 
 	l := new(Listener)
 	l.conn = conn
+	l.hasSid = hasSid
 	l.sessions = make(map[string]*UDPSession)
 	l.chAccepts = make(chan *UDPSession, 1024)
 	l.chDeadlinks = make(chan string, 1024)
@@ -839,7 +899,9 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 	if l.fec != nil {
 		l.headerSize += fecHeaderSizePlus2
 	}
-	l.headerSize += sidSize
+	if l.hasSid {
+		l.headerSize += sidSize + tsSize
+	}
 
 	go l.monitor()
 	return l, nil
@@ -847,11 +909,11 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 
 // Dial connects to the remote address "raddr" on the network "udp"
 func Dial(raddr string) (*UDPSession, error) {
-	return DialWithOptions(raddr, nil, 0, 0)
+	return DialWithOptions(raddr, false, nil, 0, 0)
 }
 
 // DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption
-func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards int, opts ...Option) (*UDPSession, error) {
+func DialWithOptions(raddr string, hasSid bool, block BlockCrypt, dataShards, parityShards int, opts ...Option) (*UDPSession, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", raddr)
 	if err != nil {
 		return nil, err
@@ -873,8 +935,14 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 			log.Println("unrecognized option", opt)
 		}
 	}
-	sid := uuid.NewV4().Bytes()
-	return newUDPSession(sid, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
+
+	var sid []byte = nil
+
+	if hasSid {
+		sid = uuid.NewV4().Bytes()
+	}
+
+	return newUDPSession(hasSid, sid, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
 }
 
 func currentMs() uint32 {
