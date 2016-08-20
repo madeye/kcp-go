@@ -49,6 +49,7 @@ type (
 	UDPSession struct {
 		hasSid            bool         // if we have a session ID
 		sid               []byte       // session ID
+		tsDiff            int32        // timestamp diff between client and server
 		kcp               *KCP         // the core ARQ
 		fec               *FEC         // forward error correction
 		conn              *net.UDPConn // the underlying UDP socket
@@ -75,9 +76,10 @@ type (
 )
 
 // newUDPSession create a new udp session for client or server
-func newUDPSession(hasSid bool, sid []byte, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
+func newUDPSession(hasSid bool, sid []byte, tsDiff int32, conv uint32, dataShards, parityShards int, l *Listener, conn *net.UDPConn, remote *net.UDPAddr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
 	sess.hasSid = hasSid
+	sess.tsDiff = tsDiff
 	sess.chTicker = make(chan time.Time, 1)
 	sess.chUDPOutput = make(chan []byte, txQueueLimit)
 	sess.die = make(chan struct{})
@@ -770,7 +772,12 @@ func (l *Listener) monitor() {
 					}
 
 					if convValid {
-						if s := newUDPSession(l.hasSid, sid, conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
+						now := currentMs()
+						tsDiff := int32(now) - int32(ts)
+						if tsDiff < 0 {
+							tsDiff = -tsDiff
+						}
+						if s := newUDPSession(l.hasSid, sid, tsDiff, conv, l.dataShards, l.parityShards, l, l.conn, from, l.block); s != nil {
 							s.kcpInput(data)
 							l.sessions[key] = s
 							l.chAccepts <- s
@@ -782,7 +789,7 @@ func (l *Listener) monitor() {
 					if l.hasSid {
 						now := currentMs()
 						diff := int32(now) - int32(ts)
-						if diff < IKCP_RTO_DEF && diff > -IKCP_RTO_DEF {
+						if diff < IKCP_RTO_DEF+s.tsDiff && diff > -(IKCP_RTO_DEF+s.tsDiff) {
 							s.mu.Lock()
 							s.remote = from
 							s.mu.Unlock()
@@ -939,10 +946,10 @@ func DialWithOptions(raddr string, hasSid bool, block BlockCrypt, dataShards, pa
 	var sid []byte = nil
 
 	if hasSid {
-		sid = uuid.NewV4().Bytes()
+		sid = uuid.NewV2().Bytes()
 	}
 
-	return newUDPSession(hasSid, sid, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
+	return newUDPSession(hasSid, sid, 0, convid, dataShards, parityShards, nil, udpconn, udpaddr, block), nil
 }
 
 func currentMs() uint32 {
