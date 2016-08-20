@@ -861,7 +861,7 @@ func (l *Listener) Addr() net.Addr {
 
 // Listen listens for incoming KCP packets addressed to the local address laddr on the network "udp",
 func Listen(laddr string) (*Listener, error) {
-	return ListenWithOptions(laddr, false, nil, 0, 0)
+	return ListenWithOptions(laddr, true, nil, 0, 0)
 }
 
 // ListenWithOptions listens for incoming KCP packets addressed to the local address laddr on the network "udp" with packet encryption,
@@ -909,10 +909,10 @@ func ListenWithOptions(laddr string, hasSid bool, block BlockCrypt, dataShards, 
 
 // Dial connects to the remote address "raddr" on the network "udp"
 func Dial(raddr string) (*UDPSession, error) {
-	return DialWithOptions(raddr, false, nil, 0, 0)
+	return DialWithOptions(raddr, true, nil, 0, 0)
 }
 
-// DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption
+// DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption and sid
 func DialWithOptions(raddr string, hasSid bool, block BlockCrypt, dataShards, parityShards int, opts ...Option) (*UDPSession, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", raddr)
 	if err != nil {
