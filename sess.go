@@ -489,7 +489,7 @@ func (s *UDPSession) outputTask() {
 
 			if s.l == nil && time.Now().After(lastRedial.Add(redialInterval)) {
 				udpconn, err := net.DialUDP("udp", nil, s.remote.(*net.UDPAddr))
-				if err != nil {
+				if err == nil {
 					s.mu.Lock()
 					s.conn = udpconn
 					s.mu.Unlock()
