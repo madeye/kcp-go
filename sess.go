@@ -42,7 +42,7 @@ const (
 	txQueueLimit             = 8192
 	rxFecLimit               = 8192
 	defaultKeepAliveInterval = 10 * time.Second
-	redialInterval           = 5  * time.Minute
+	redialInterval           = 1 * time.Minute
 )
 
 type (
@@ -487,10 +487,12 @@ func (s *UDPSession) outputTask() {
 			remote := s.remote
 			s.mu.Unlock()
 
-			if s.l == nil && time.Now().After(lastRedial.Add(redialInterval)) {
+			if s.hasSid && s.l == nil &&
+				time.Now().After(lastRedial.Add(redialInterval)) {
 				udpconn, err := net.DialUDP("udp", nil, s.remote.(*net.UDPAddr))
 				if err == nil {
 					s.mu.Lock()
+					s.conn.Close()
 					s.conn = udpconn
 					s.mu.Unlock()
 				}
@@ -646,15 +648,25 @@ func (s *UDPSession) kcpInput(data []byte) {
 }
 
 func (s *UDPSession) receiver(ch chan []byte) {
+	retry := 3
 	for {
 		data := s.xmitBuf.Get().([]byte)[:mtuLimit]
-		if n, err := s.conn.Read(data); err == nil && n >= s.headerSize+IKCP_OVERHEAD {
+		s.mu.Lock()
+		conn := s.conn
+		s.mu.Unlock()
+		n, err := conn.Read(data)
+		if err == nil && n >= s.headerSize+IKCP_OVERHEAD {
 			select {
 			case ch <- data[:n]:
 			case <-s.die:
 			}
+			retry = 3
 		} else if err != nil {
-			return
+			if retry <= 0 {
+				log.Println("Error when reading:", err)
+				return
+			}
+			retry--
 		} else {
 			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
 		}
