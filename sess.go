@@ -42,6 +42,7 @@ const (
 	txQueueLimit             = 8192
 	rxFecLimit               = 8192
 	defaultKeepAliveInterval = 10 * time.Second
+	redialInterval           = 10 * time.Second
 )
 
 type (
@@ -390,7 +391,10 @@ func (s *UDPSession) SetKeepAlive(interval int) {
 // writeTo wraps write method for client & listener
 func (s *UDPSession) writeTo(b []byte, addr net.Addr) (int, error) {
 	if s.l == nil {
-		return s.conn.Write(b)
+		s.mu.Lock()
+		n, err := s.conn.Write(b)
+		s.mu.Unlock()
+		return n, err
 	}
 	return s.conn.WriteTo(b, addr)
 }
@@ -421,6 +425,9 @@ func (s *UDPSession) outputTask() {
 	var lastPing time.Time
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+
+	// redial for client
+	lastRedial := time.Now()
 
 	for {
 		select {
@@ -478,6 +485,13 @@ func (s *UDPSession) outputTask() {
 
 			s.mu.Lock()
 			remote := s.remote
+			if s.l == nil && time.Now().After(lastRedial.Add(redialInterval)) {
+				udpconn, err := net.DialUDP("udp", nil, s.remote.(*net.UDPAddr))
+				if err != nil {
+					s.conn = udpconn
+				}
+				lastRedial = time.Now()
+			}
 			s.mu.Unlock()
 
 			//if rand.Intn(100) < 80 {
@@ -789,7 +803,7 @@ func (l *Listener) monitor() {
 					if l.hasSid {
 						now := currentMs()
 						diff := int32(now) - int32(ts)
-						if diff < IKCP_RTO_DEF+s.tsDiff && diff > -(IKCP_RTO_DEF+s.tsDiff) {
+						if diff < IKCP_RTO_DEF*2+s.tsDiff && diff > -(IKCP_RTO_DEF*2+s.tsDiff) {
 							s.mu.Lock()
 							s.remote = from
 							s.mu.Unlock()
