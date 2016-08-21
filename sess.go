@@ -392,9 +392,9 @@ func (s *UDPSession) SetKeepAlive(interval int) {
 func (s *UDPSession) writeTo(b []byte, addr net.Addr) (int, error) {
 	if s.l == nil {
 		s.mu.Lock()
-		n, err := s.conn.Write(b)
+		conn := s.conn
 		s.mu.Unlock()
-		return n, err
+		return conn.Write(b)
 	}
 	return s.conn.WriteTo(b, addr)
 }
@@ -485,14 +485,17 @@ func (s *UDPSession) outputTask() {
 
 			s.mu.Lock()
 			remote := s.remote
+			s.mu.Unlock()
+
 			if s.l == nil && time.Now().After(lastRedial.Add(redialInterval)) {
 				udpconn, err := net.DialUDP("udp", nil, s.remote.(*net.UDPAddr))
 				if err != nil {
+					s.mu.Lock()
 					s.conn = udpconn
+					s.mu.Unlock()
 				}
 				lastRedial = time.Now()
 			}
-			s.mu.Unlock()
 
 			//if rand.Intn(100) < 80 {
 			n, err := s.writeTo(ext, remote)
