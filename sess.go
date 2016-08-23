@@ -42,7 +42,7 @@ const (
 	txQueueLimit             = 8192
 	rxFecLimit               = 8192
 	defaultKeepAliveInterval = 10 * time.Second
-	redialInterval           = 1 * time.Minute
+	redialInterval           = 10 * time.Second
 )
 
 type (
