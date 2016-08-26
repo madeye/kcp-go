@@ -2,12 +2,11 @@ package kcp
 
 import (
 	"bytes"
-	crand "crypto/rand"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -72,7 +71,6 @@ type (
 		ackNoDelay        bool
 		keepAliveInterval time.Duration
 		xmitBuf           sync.Pool
-		rng               *rand.Rand
 	}
 )
 
@@ -93,7 +91,6 @@ func newUDPSession(hasSid bool, sid []byte, tsDiff int32, conv uint32, dataShard
 	sess.l = l
 	sess.block = block
 	sess.fec = newFEC(rxFecLimit, dataShards, parityShards)
-	sess.rng = rand.New(rand.NewSource(time.Now().UnixNano()))
 	sess.xmitBuf.New = func() interface{} {
 		return make([]byte, mtuLimit)
 	}
@@ -468,14 +465,14 @@ func (s *UDPSession) outputTask() {
 			}
 
 			if s.block != nil {
-				io.ReadFull(crand.Reader, ext[:nonceSize])
+				io.ReadFull(rand.Reader, ext[:nonceSize])
 				checksum := crc32.ChecksumIEEE(ext[cryptHeaderSize:])
 				binary.LittleEndian.PutUint32(ext[nonceSize:], checksum)
 				s.block.Encrypt(ext, ext)
 
 				if ecc != nil {
 					for k := range ecc {
-						io.ReadFull(crand.Reader, ecc[k][:nonceSize])
+						io.ReadFull(rand.Reader, ecc[k][:nonceSize])
 						checksum := crc32.ChecksumIEEE(ecc[k][cryptHeaderSize:])
 						binary.LittleEndian.PutUint32(ecc[k][nonceSize:], checksum)
 						s.block.Encrypt(ecc[k], ecc[k])
@@ -527,10 +524,12 @@ func (s *UDPSession) outputTask() {
 				remote := s.remote
 				s.mu.Unlock()
 				if interval > 0 && time.Now().After(lastPing.Add(interval)) {
-					sz := s.rng.Intn(IKCP_MTU_DEF - s.headerSize - IKCP_OVERHEAD)
-					sz += s.headerSize + IKCP_OVERHEAD
+					buf := make([]byte, 2)
+					io.ReadFull(rand.Reader, buf)
+					rnd := int(binary.LittleEndian.Uint16(buf))
+					sz := rnd%(IKCP_MTU_DEF-s.headerSize-IKCP_OVERHEAD) + s.headerSize + IKCP_OVERHEAD
 					ping := make([]byte, sz)
-					io.ReadFull(crand.Reader, ping)
+					io.ReadFull(rand.Reader, ping)
 					n, err := s.writeTo(ping, remote)
 					if err != nil {
 						log.Println(err, n)
@@ -875,7 +874,12 @@ func (l *Listener) SetDSCP(dscp int) error {
 }
 
 // Accept implements the Accept method in the Listener interface; it waits for the next call and returns a generic Conn.
-func (l *Listener) Accept() (*UDPSession, error) {
+func (l *Listener) Accept() (net.Conn, error) {
+	return l.AcceptKCP()
+}
+
+// AcceptKCP accepts a KCP connection
+func (l *Listener) AcceptKCP() (*UDPSession, error) {
 	select {
 	case c := <-l.chAccepts:
 		return c, nil
@@ -961,7 +965,7 @@ func DialWithOptions(raddr string, hasSid bool, block BlockCrypt, dataShards, pa
 	}
 
 	buf := make([]byte, 4)
-	io.ReadFull(crand.Reader, buf)
+	io.ReadFull(rand.Reader, buf)
 	convid := binary.LittleEndian.Uint32(buf)
 	for k := range opts {
 		switch opt := opts[k].(type) {
